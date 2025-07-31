@@ -1,0 +1,276 @@
+﻿using RoutePlannerAPI.Models;
+using System.Formats.Asn1;
+using System.Globalization;
+
+namespace RoutePlannerAPI.Services
+{
+    public class RoutePlannerService : IRoutePlannerService
+    {
+        public const double DefaultVisitTime = 1800; // 30 минут в секундах
+        public const int PriorityWeightPenalty = 300;
+        public const double TimeTolerance = 600; // 10 минут
+        public const int FrequencyPriorityWeight = 200;
+        public const double MaxDistanceLimit = 100; // Максимальное расстояние между точками в км (кроме первой пары)
+
+        public enum PlanningPeriod
+        {
+            Week = 7,
+            Month = 30,
+            Quarter = 65,
+            Custom = 57
+        }
+
+        static List<RouteSegment> ReadRouteSegmentsFromCsv(string filePath)
+        {
+            var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+            {
+                Delimiter = ";",
+                MissingFieldFound = null,
+                HeaderValidated = null,
+                BadDataFound = null
+            };
+
+            using (var reader = new StreamReader(filePath))
+            using (var csv = new CsvReader(reader, config))
+            {
+                return csv.GetRecords<RouteSegment>().ToList();
+            }
+        }
+
+        public RoutePlanResponse GenerateSchedule(RoutePlanRequest request)
+        {
+            var segments = request.Segments.Select(s => new RouteSegment
+            {
+                IdOutlet1 = s.IdOutlet1,
+                IdOutlet2 = s.IdOutlet2,
+                Time = s.Time,
+                Length = s.Length,
+                Cost = s.Cost,
+                Priority1 = s.Priority1,
+                Priority2 = s.Priority2,
+                TimeVisit1 = s.TimeVisit1,
+                TimeVisit2 = s.TimeVisit2,
+                Frequency1 = s.Frequency1,
+                Frequency2 = s.Frequency2,
+                FrequencyPriority1 = s.FrequencyPriority1,
+                FrequencyPriority2 = s.FrequencyPriority2
+            }).ToList();
+
+            var outlets = CollectAllOutlets(segments);
+            var schedule = GenerateScheduleInternal(
+                segments,
+                request.TotalDays,
+                request.WorkingHoursPerDay,
+                request.UseFixedStartPoint,
+                request.FixedStartPointId);
+
+            var optimizedSchedule = OptimizeDailyRoutes(
+                schedule,
+                segments,
+                request.UseFixedStartPoint);
+
+            return MapToResponse(optimizedSchedule, outlets);
+        }
+
+        private RoutePlanResponse MapToResponse(List<DailyRoute> schedule, Dictionary<long, OutletInfo> outlets)
+        {
+            var response = new RoutePlanResponse
+            {
+                Schedule = new List<DailyRouteResponse>()
+            };
+
+            foreach (var route in schedule)
+            {
+                var dailyRoute = new DailyRouteResponse
+                {
+                    DayNumber = route.DayNumber,
+                    TotalTime = route.TotalTime,
+                    TotalCost = route.TotalCost,
+                    Outlets = new List<RoutePointResponse>()
+                };
+
+                for (int i = 0; i < route.Outlets.Count; i++)
+                {
+                    var outletId = route.Outlets[i].OutletId;
+                    var outletInfo = outlets[outletId];
+
+                    dailyRoute.Outlets.Add(new RoutePointResponse
+                    {
+                        RoutePointNumber = i + 1,
+                        OutletId = outletId,
+                        Priority = outletInfo.Priority,
+                        Frequency = outletInfo.Frequency,
+                        FrequencyPriority = outletInfo.FrequencyPriority,
+                        VisitTime = route.Outlets[i].VisitTime,
+                        TravelTime = route.Outlets[i].TravelTime
+                    });
+                }
+
+                response.Schedule.Add(dailyRoute);
+            }
+
+            return response;
+        }
+
+        static void AddMissingOutlets(
+            List<DailyRoute> schedule,
+            List<RouteSegment> segments,
+            Dictionary<long, OutletInfo> outlets,
+            VisitTracker visitTracker,
+            double maxDailyTime)
+        {
+            var missingOutlets = outlets.Keys
+                .Where(id => visitTracker.GetVisitCount(id) < outlets[id].Frequency)
+                .ToList();
+
+            foreach (var outletId in missingOutlets)
+            {
+                var outlet = outlets[outletId];
+                int visitsNeeded = outlet.Frequency - visitTracker.GetVisitCount(outletId);
+
+                for (int visit = 0; visit < visitsNeeded; visit++)
+                {
+                    foreach (var dayRoute in schedule.OrderBy(r => r.TotalTime))
+                    {
+                        if (visitTracker.GetVisitCount(outletId) >= outlet.Frequency)
+                            break;
+
+                        for (int i = 0; i < dayRoute.Outlets.Count - 1; i++)
+                        {
+                            var current = dayRoute.Outlets[i];
+                            var next = dayRoute.Outlets[i + 1];
+
+                            var segmentToMissing = segments.FirstOrDefault(s =>
+                                s.IdOutlet1 == current.OutletId && s.IdOutlet2 == outletId);
+
+                            var segmentFromMissing = segments.FirstOrDefault(s =>
+                                s.IdOutlet1 == outletId && s.IdOutlet2 == next.OutletId);
+
+                            if (segmentToMissing != null && segmentFromMissing != null)
+                            {
+                                // Проверяем ограничение по расстоянию (кроме первого перехода)
+                                bool isFirstPair = (i == 0 && dayRoute.Outlets.Count == 1);
+                                if (!isFirstPair && (segmentToMissing.Length > MaxDistanceLimit ||
+                                    segmentFromMissing.Length > MaxDistanceLimit))
+                                {
+                                    continue;
+                                }
+
+                                var totalAddedTime = segmentToMissing.Time + outlet.TimeVisit + segmentFromMissing.Time;
+                                var originalTime = segments.First(s =>
+                                    s.IdOutlet1 == current.OutletId && s.IdOutlet2 == next.OutletId).Time;
+
+                                if (dayRoute.TotalTime + totalAddedTime - originalTime <= maxDailyTime + TimeTolerance)
+                                {
+                                    dayRoute.Outlets.Insert(i + 1, new RoutePoint
+                                    {
+                                        OutletId = outletId,
+                                        VisitTime = outlet.TimeVisit,
+                                        TravelTime = segmentToMissing.Time
+                                    });
+                                    dayRoute.TotalTime += totalAddedTime - originalTime;
+                                    visitTracker.RecordVisit(outletId, dayRoute.DayNumber);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        static double CalculateSegmentWeight(RouteSegment segment, VisitTracker tracker, Dictionary<long, OutletInfo> outlets, int currentDay)
+        {
+            var outlet = outlets[segment.IdOutlet2];
+            double weight = segment.Cost;
+
+
+            if (outlet.Priority >= 1) // Проверяем, что приоритет задан (>=1)
+                weight += PriorityWeightPenalty * (1.0 / outlet.Priority); // Инвертируем приоритет
+
+            var visitsNeeded = tracker.GetRequiredVisits(segment.IdOutlet2, currentDay);
+            var visitsActual = tracker.GetVisitCount(segment.IdOutlet2);
+
+            if (visitsActual < visitsNeeded)
+                weight -= (visitsNeeded - visitsActual) * 500;
+
+            if (visitsActual >= outlet.Frequency)
+                weight -= outlet.FrequencyPriority * FrequencyPriorityWeight;
+
+            return weight;
+        }
+
+        static Dictionary<long, OutletInfo> CollectAllOutlets(List<RouteSegment> segments)
+        {
+            var outlets = new Dictionary<long, OutletInfo>();
+
+            foreach (var segment in segments)
+            {
+                if (!outlets.ContainsKey(segment.IdOutlet1))
+                {
+                    outlets[segment.IdOutlet1] = new OutletInfo
+                    {
+                        Id = segment.IdOutlet1,
+                        Priority = segment.Priority1,
+                        Frequency = segment.Frequency1,
+                        FrequencyPriority = segment.FrequencyPriority1,
+                        TimeVisit = segment.TimeVisit1 > 0 ? segment.TimeVisit1 * 60 : DefaultVisitTime
+                    };
+                }
+
+                if (!outlets.ContainsKey(segment.IdOutlet2))
+                {
+                    outlets[segment.IdOutlet2] = new OutletInfo
+                    {
+                        Id = segment.IdOutlet2,
+                        Priority = segment.Priority2,
+                        Frequency = segment.Frequency2,
+                        FrequencyPriority = segment.FrequencyPriority2,
+                        TimeVisit = segment.TimeVisit2 > 0 ? segment.TimeVisit2 * 60 : DefaultVisitTime
+                    };
+                }
+            }
+
+            return outlets;
+        }
+
+        static void WriteToCsv(List<DailyRoute> schedule, Dictionary<long, OutletInfo> outlets, string filePath)
+        {
+            var records = new List<CsvOutput>();
+
+            foreach (var route in schedule)
+            {
+                for (int i = 0; i < route.Outlets.Count; i++)
+                {
+                    var outletId = route.Outlets[i].OutletId;
+                    var outletInfo = outlets[outletId];
+
+                    records.Add(new CsvOutput
+                    {
+                        DayNumber = route.DayNumber,
+                        RoutePointNumber = i + 1,
+                        OutletId = outletId,
+                        Priority = outletInfo.Priority,
+                        Frequency = outletInfo.Frequency,
+                        FrequencyPriority = outletInfo.FrequencyPriority,
+                        VisitTime = route.Outlets[i].VisitTime,
+                        TravelTime = route.Outlets[i].TravelTime,
+                        TotalRouteTime = route.TotalTime,
+                        TotalRouteCost = route.TotalCost
+                    });
+                }
+            }
+
+            var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+            {
+                Delimiter = ";"
+            };
+
+            using (var writer = new StreamWriter(filePath))
+            using (var csv = new CsvWriter(writer, config))
+            {
+                csv.WriteRecords(records);
+            }
+        }
+    }
+}
