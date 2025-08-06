@@ -15,6 +15,6 @@
         public int Frequency2 { get; set; }
         public int FrequencyPriority1 { get; set; }
         public int FrequencyPriority2 { get; set; }
-        public char TypeMovements { get; set; }
+        //public char TypeMovements { get; set; }
     }
 }
