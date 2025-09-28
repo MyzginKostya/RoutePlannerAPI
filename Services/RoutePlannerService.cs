@@ -184,17 +184,17 @@ namespace RoutePlannerAPI.Services
                     outlets
              );
 
-
+            /*
             // оптимизация маршрута в рамках одного дня
             var optimizedSchedule = RouteOptimizer.OptimizeDailyRoutes(
                 schedule,
                 segments,
                 request.UseFixedStartPoint
             );
+            */
 
-
-            var response = MapToResponse(optimizedSchedule, outlets);
-            var result = WriteToCsv(optimizedSchedule, outlets);
+            var response = MapToResponse(schedule, outlets);
+            var result = WriteToCsv(schedule, outlets);
             return result;
 
         }
