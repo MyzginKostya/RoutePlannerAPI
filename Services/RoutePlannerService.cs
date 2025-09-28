@@ -10,12 +10,14 @@ namespace RoutePlannerAPI.Services
 {
     public class RoutePlannerService
     {
+
         public const double DefaultVisitTime = 1800; // 30 минут в секундах
-        public const int PriorityWeightPenalty = 300;
+        public const int PriorityWeightPenalty = 300; // штраф за приоритет
         public const double TimeTolerance = 600; // 10 минут
         public const int FrequencyPriorityWeight = 200;
         public const double MaxDistanceLimit = 100; // Максимальное расстояние между точками в км (кроме первой пары)
 
+        // это я пока оставлю. Сейчас не использую, но в будущем хотел бы прикрутить
         public enum PlanningPeriod
         {
             Week = 7,
@@ -24,25 +26,22 @@ namespace RoutePlannerAPI.Services
             Custom = 57,
         }
 
-        static List<RouteSegment> ReadRouteSegmentsFromCsv(string filePath)
-        {
-            var config = new CsvConfiguration(CultureInfo.InvariantCulture)
-            {
-                Delimiter = ";",
-                MissingFieldFound = null,
-                HeaderValidated = null,
-                BadDataFound = null,
-            };
 
-            using (var reader = new StreamReader(filePath))
-            using (var csv = new CsvReader(reader, config))
-            {
-                return csv.GetRecords<RouteSegment>().ToList();
-            }
-        }
-
+        // метод GenerateScheduleAsync подготоваливает массив данных для прохода по графу, а после получения результата от GenerateScheduleInternal отпимизирует его, в рамках одного дня
+        // возвращает результат в виде списка объектов CsvOutput
         public async Task<List<CsvOutput>> GenerateScheduleAsync(RoutePlanRequest request)
         {
+            // ряд проверок на корректность входных данных
+            if (request == null)
+                throw new ArgumentNullException("Request body is null.");
+
+            if (request.Segments == null || !request.Segments.Any())
+                throw new ArgumentException("Request.Segments is null or empty.");
+
+            if (request.UseFixedStartPoint && request.FixedStartPointId <= 0)
+                throw new ArgumentException("FixedStartPointId must be a positive id when UseFixedStartPoint=true.");
+
+            // копируем сегменты из входящего датапула
             var segments = request
                 .Segments.Select(s => new RouteSegment
                 {
@@ -62,16 +61,27 @@ namespace RoutePlannerAPI.Services
                 })
                 .ToList();
 
+            // готовим только уникальные точки из всего набора данных с их атрибутами
             var outlets = CollectAllOutlets(segments);
+
+            if (outlets.Count == 0)
+                throw new InvalidOperationException("No outlets could be collected from the provided segments.");
+
+            if (request.UseFixedStartPoint && !outlets.ContainsKey(request.FixedStartPointId))
+                throw new InvalidOperationException($"FixedStartPointId {request.FixedStartPointId} is not present among outlets.");
+
+            // создаем расписание
             var schedule = GenerateScheduleInternal(
                 segments,
                 request.TotalDays,
                 request.WorkingHoursPerDay,
+                request.MaxCountVisists,
                 request.UseFixedStartPoint,
                 request.FixedStartPointId,
                 outlets
             );
 
+            // оптимизация маршрута в рамках одного дня
             var optimizedSchedule = RouteOptimizer.OptimizeDailyRoutes(
                 schedule,
                 segments,
@@ -84,41 +94,44 @@ namespace RoutePlannerAPI.Services
         }
 
         private List<DailyRoute> GenerateScheduleInternal(
-            List<RouteSegment> segments,
-            int totalDays,
-            double workingHoursPerDay,
-            bool useFixedStartPoint,
-            long fixedStartPointId,
-            Dictionary<long, OutletInfo> outlets
+            List<RouteSegment> segments, // все возможные отрезки путей между точками (ориентированный граф)
+            int totalDays, // общее количество дней на которое планируем маршрут
+            double workingHoursPerDay, // количество рабочих часов в день
+            int MaxCountVisits, // максимальное количество визитов в день
+            bool useFixedStartPoint, // нужно ли начинать всегда из одной ТТ?
+            long fixedStartPointId, // если нужно начинать из конкретной точки каждый день, то здесь будет id этой точки, иначе 0
+            Dictionary<long, OutletInfo> outlets // справочная информация по всем точкам
         )
         {
-            var schedule = new List<DailyRoute>();
-            var random = new Random();
-            var visitTracker = new VisitTracker(outlets, totalDays);
-            var routeHistory = new HashSet<string>();
+            var schedule = new List<DailyRoute>(); // список с результатом сформированного дневного маршрута
+            var random = new Random(); // чтобы генерировать случайные числа
+            var visitTracker = new VisitTracker(outlets, totalDays); // счетчик количества посещений каждой точки
+            var routeHistory = new HashSet<string>(); // хочу всегда уникальные маршруты
 
-            double maxDailyTime = workingHoursPerDay * 3600;
+            double maxDailyTime = workingHoursPerDay * 3600; // переводим максимальное количество времени на маршрут из часов в секунды
             long currentStartOutlet = useFixedStartPoint
-                ? fixedStartPointId
-                : outlets.Keys.ElementAt(random.Next(outlets.Count));
+                ? fixedStartPointId // если нужна фиксированная точка, то берем ее ID
+                : outlets.Keys.ElementAt(random.Next(outlets.Count)); // иначе выбор стартовой точки рандомно
 
-            for (int day = 1; day <= totalDays; day++)
+            for (int day = 1; day <= totalDays; day++) // начинаем цикл по всем дням от первого до номера в totalDays
             {
-                var dailyRoute = new DailyRoute { DayNumber = day };
-                double dailyTimeUsed = 0;
-                var visitedToday = new HashSet<long>();
-                int attempt = 0;
-                const int maxAttempts = 100;
+                var dailyRoute = new DailyRoute { DayNumber = day }; // объект для маршрута на один день
+                double dailyTimeUsed = 0; // переменная для подсчета времени на маршруте за день
+                var visitedToday = new HashSet<long>(); // записываем точки, посещенные в этот день - гарант того, что мы не посетим точку более одного раза за день
+                int attempt = 0; // сколько раз попытались построить уникальный маршрут
+                const int maxAttempts = 100; // не более 100 раз пытаемся
 
+                // циклом строим уникальные маршруты
+                // Если построенный маршрут совпадает с каким-то из ранее созданных (routeHistory), он делает новую попытку
                 while (attempt++ < maxAttempts)
                 {
                     dailyRoute.Outlets.Clear();
-                    dailyTimeUsed = 0;
-                    visitedToday.Clear();
+                    dailyTimeUsed = 0; // обнуляем счетчик времени
+                    visitedToday.Clear(); // очищаем список посещенных ТТ в этот день
 
-                    long currentOutlet = currentStartOutlet;
+                    long currentOutlet = currentStartOutlet; // начинаем день с выбранной стартовой точки
 
-                    if (useFixedStartPoint || visitTracker.CanVisit(currentOutlet, day))
+                    if (useFixedStartPoint || visitTracker.CanVisit(currentOutlet, day)) // проверяем можем ли мы посетить эту ТТ, согласно частоте посещений + берем стартовую ТТ
                     {
                         var visitTime = outlets[currentOutlet].TimeVisit;
                         dailyRoute.Outlets.Add(
@@ -126,99 +139,110 @@ namespace RoutePlannerAPI.Services
                             {
                                 OutletId = currentOutlet,
                                 VisitTime = visitTime,
-                                TravelTime = 0,
+                                TravelTime = 0, // до первой точки путь всегда 0
                             }
                         );
                         dailyTimeUsed += visitTime;
-                        visitedToday.Add(currentOutlet);
+                        visitedToday.Add(currentOutlet); // помечаю точку как посещенную
                     }
 
-                    while (dailyTimeUsed < maxDailyTime)
+                    while (dailyTimeUsed < maxDailyTime) // проверяю, что в рабочем дне еще есть время для посещений
                     {
+
+                        if (dailyRoute.Outlets.Count >= MaxCountVisits) // проверка на превышение максимального количества посещений в день
+                        {
+                            Console.WriteLine($"Достигнуто максимальное количество точек ({MaxCountVisits}) для дня {day}");
+                            break;
+                        }
+
                         var availableSegments = segments
-                            .Where(s => s.IdOutlet1 == currentOutlet)
+                            .Where(s => s.IdOutlet1 == currentOutlet) // рассматриваем только те ТТ, с которыми есть пересечение, то есть до которых можно дойти из текущей ТТ
                             .Where(s =>
                                 visitTracker.CanVisit(s.IdOutlet2, day)
-                                && !visitedToday.Contains(s.IdOutlet2)
+                                && !visitedToday.Contains(s.IdOutlet2) // и только те ТТ, которые можно посетить в этот день и которые не посещали сегодня
                             )
                             // Применяем ограничение по расстоянию (кроме первого перехода)
                             .Where(s =>
                                 dailyRoute.Outlets.Count <= 1 || s.Length <= MaxDistanceLimit
                             )
-                            .Where(s => s != null)
-                            .ToList();
+                            .Where(s => s != null) // проверка на отсутсвие null значений
+                            .ToList(); // представляем все это списком
 
-                        if (!availableSegments.Any())
+                        if (!availableSegments.Any()) // если не нашли ни одного варианта, то есть зашли в тупик, то выходим из цикла
                         {
                             Console.WriteLine($"Нет доступных точек для дня {day}");
                             break;
                         }
 
+                        // выбираю лучший вариант
                         var bestSegment = availableSegments
-                            .OrderBy(s => visitTracker.GetVisitCount(s.IdOutlet2))
-                            .ThenBy(s => CalculateSegmentWeight(s, visitTracker, outlets, day))
-                            .First();
+                            .OrderBy(s => visitTracker.GetVisitCount(s.IdOutlet2)) // точки, которые реже всего требуют посещений (чем меньше раз посетили, тем лучше)
+                            .ThenBy(s => CalculateSegmentWeight(s, visitTracker, outlets, day)) // точка с наименьшим весом (чем меньше вес тем лучше)
+                            .First(); // беру первый элемент из полученного сортированного списка
 
-                        var nextOutlet = bestSegment.IdOutlet2;
-                        var visitTime = outlets[nextOutlet].TimeVisit;
-                        var totalTime = bestSegment.Time + visitTime;
+                        var nextOutlet = bestSegment.IdOutlet2; // находим выбранную точку с ее атрибутами
+                        var visitTime = outlets[nextOutlet].TimeVisit; // получаем время визита для выбранной точки
+                        var totalTime = bestSegment.Time + visitTime; // общее время складывается из времени в пути до точки + время на визит в ТТ
 
-                        if (dailyTimeUsed + totalTime > maxDailyTime + TimeTolerance)
-                            break;
+                        if (dailyTimeUsed + totalTime > maxDailyTime + TimeTolerance) // проверка на то, что на маршруте сотрудник потратит не больше чем это задано + 10 минут (допуск)
+                            break; // выходим из цикла если день заполнен
 
-                        dailyRoute.Outlets.Add(
+                        dailyRoute.Outlets.Add( // добавление выбранной точки в дневной маршрут
                             new RoutePoint
                             {
                                 OutletId = nextOutlet,
                                 VisitTime = visitTime,
-                                TravelTime = bestSegment.Time,
+                                TravelTime = bestSegment.Time, // время на дорогу до точки
                             }
                         );
 
-                        visitedToday.Add(nextOutlet);
-                        dailyTimeUsed += totalTime;
-                        currentOutlet = nextOutlet;
+                        visitedToday.Add(nextOutlet); // помечаю точку, как посещенную в этот день
+                        dailyTimeUsed += totalTime; // прибалвяю затраченное на этот визит время к общему времени на маршруте за этот день
+                        currentOutlet = nextOutlet; // теперь точка старта - это та точка в которую я только что приехал
                     }
 
+                    // храню полученный уникальный маршрут в виде списка id точек
                     var routeSignature = string.Join(
                         ",",
                         dailyRoute.Outlets.Select(o => o.OutletId)
                     );
-                    if (!routeHistory.Contains(routeSignature) && dailyRoute.Outlets.Count >= 2)
+                    if (!routeHistory.Contains(routeSignature) && dailyRoute.Outlets.Count >= 2) // если такой маршрут ранее не был сгенерирован и в маршруте более 2 точек
                     {
                         routeHistory.Add(routeSignature);
-                        break;
+                        break; // выход из цикла, если найден уникальный маршрут
                     }
                 }
 
+                // если стартовая точка была задана, то не учитываем ее как визит, иначе учитываются все ТТ
                 foreach (var point in dailyRoute.Outlets.Skip(useFixedStartPoint ? 1 : 0))
                 {
                     visitTracker.RecordVisit(point.OutletId, day);
                 }
 
-                if (dailyRoute.Outlets.Count >= 2)
+                if (dailyRoute.Outlets.Count >= 2) // добавляем маршрут только если в нем есть хотя бы 2 точки в день
                 {
-                    dailyRoute.TotalTime = dailyTimeUsed;
-                    schedule.Add(dailyRoute);
+                    dailyRoute.TotalTime = dailyTimeUsed; // общее время на маршруте
+                    schedule.Add(dailyRoute); // добавление в раписание
                 }
 
-                if (!useFixedStartPoint)
+                if (!useFixedStartPoint) // если стартовая точка не была фиксированной, то начинаем следующий день с той точки, которая была посещена меньше всего раз
                 {
                     currentStartOutlet = visitTracker.GetLeastVisitedOutlet(outlets.Keys);
                 }
             }
 
-            AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime);
-            return schedule;
+            AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime, MaxCountVisits); // если маршруты созданы на все дни, но остались точки которые нужно еще посетить, то пытаемся добавить их в уже существующие маршруты
+            return schedule; // возвращаю готовое расписание
         }
 
         private RoutePlanResponse MapToResponse(
-            List<DailyRoute> schedule,
-            Dictionary<long, OutletInfo> outlets
+            List<DailyRoute> schedule, // итоговое расписание маршрутов
+            Dictionary<long, OutletInfo> outlets // свойства точек
         )
         {
-            var response = new RoutePlanResponse { Schedule = new List<DailyRouteResponse>() };
+            var response = new RoutePlanResponse { Schedule = new List<DailyRouteResponse>() }; // готолю объект, в котором передам ответ от API
 
+            // перебор всех дней из получившегося расписания
             foreach (var route in schedule)
             {
                 var dailyRoute = new DailyRouteResponse
@@ -226,31 +250,33 @@ namespace RoutePlannerAPI.Services
                     DayNumber = route.DayNumber,
                     TotalTime = route.TotalTime,
                     TotalCost = route.TotalCost,
-                    Outlets = new List<RoutePointResponse>(),
+                    Outlets = new List<RoutePointResponse>(), // список точек на этот день
                 };
 
+                // перебор всех точек маршрута в порядке посещения
                 for (int i = 0; i < route.Outlets.Count; i++)
                 {
-                    var outletId = route.Outlets[i].OutletId;
-                    var outletInfo = outlets[outletId];
+                    var outletId = route.Outlets[i].OutletId; // ID точки из маршрута
+                    var outletInfo = outlets[outletId]; // свойства этой точки
 
                     dailyRoute.Outlets.Add(
                         new RoutePointResponse
                         {
-                            RoutePointNumber = i + 1,
-                            OutletId = outletId,
-                            Priority = outletInfo.Priority,
-                            Frequency = outletInfo.Frequency,
-                            FrequencyPriority = outletInfo.FrequencyPriority,
-                            VisitTime = route.Outlets[i].VisitTime,
-                            TravelTime = route.Outlets[i].TravelTime,
+                            RoutePointNumber = i + 1, // Порядковый номер точки
+                            OutletId = outletId, // ID точки
+                            Priority = outletInfo.Priority, // Приоритет из справочника
+                            Frequency = outletInfo.Frequency, // Частота посещений из справочника
+                            FrequencyPriority = outletInfo.FrequencyPriority, // Приоритет частоты
+                            VisitTime = route.Outlets[i].VisitTime, // Время посещения из маршрута
+                            TravelTime = route.Outlets[i].TravelTime, // Время пути из маршрута
                         }
                     );
                 }
-
+                // получаю объект для ответа от API
                 response.Schedule.Add(dailyRoute);
             }
 
+            // возврщаю этот ответ
             return response;
         }
 
@@ -259,27 +285,42 @@ namespace RoutePlannerAPI.Services
             List<RouteSegment> segments,
             Dictionary<long, OutletInfo> outlets,
             VisitTracker visitTracker,
-            double maxDailyTime
+            double maxDailyTime,
+            int maxCountVisitPerDay // максимальное количество посещений в день
         )
         {
+            // берем все id точек из списка
             var missingOutlets = outlets
-                .Keys.Where(id => visitTracker.GetVisitCount(id) < outlets[id].Frequency)
-                .ToList();
+                .Keys.Where(id => visitTracker.GetVisitCount(id) < outlets[id].Frequency) // находим из всего списка точек те, у которых количество посещений не было достигнуто
+                .ToList(); // формируем список точек, которые нужно еще посетить
 
-            foreach (var outletId in missingOutlets)
+            foreach (var outletId in missingOutlets) // начинаем перебирать все точки
             {
                 var outlet = outlets[outletId];
-                int visitsNeeded = outlet.Frequency - visitTracker.GetVisitCount(outletId);
+                int visitsNeeded = outlet.Frequency - visitTracker.GetVisitCount(outletId); // считаем какое количество раз, которое нужно еще допосесить точки
 
                 for (int visit = 0; visit < visitsNeeded; visit++)
                 {
                     foreach (var dayRoute in schedule.OrderBy(r => r.TotalTime))
                     {
+                        // Не превышает ли день лимит по количеству точек
+                        if (dayRoute.Outlets.Count >= maxCountVisitPerDay)
+                        {
+                            continue; // Пропускаем этот день, он уже заполнен
+                        }
+
                         if (visitTracker.GetVisitCount(outletId) >= outlet.Frequency)
                             break;
 
                         for (int i = 0; i < dayRoute.Outlets.Count - 1; i++)
                         {
+
+                            // Не превысит ли вставка максимальное количество точек
+                            if (dayRoute.Outlets.Count >= maxCountVisitPerDay)
+                            {
+                                break; // Выходим из цикла, день уже заполнен
+                            }
+
                             var current = dayRoute.Outlets[i];
                             var next = dayRoute.Outlets[i + 1];
 
@@ -306,20 +347,29 @@ namespace RoutePlannerAPI.Services
                                     continue;
                                 }
 
-                                var totalAddedTime =
-                                    segmentToMissing.Time
-                                    + outlet.TimeVisit
-                                    + segmentFromMissing.Time;
-                                var originalTime = segments
+                                var totalAddedTime = segmentToMissing.Time + outlet.TimeVisit + segmentFromMissing.Time;
+
+                                var originalSegment = segments.FirstOrDefault(s => s.IdOutlet1 == current.OutletId && s.IdOutlet2 == next.OutletId);
+
+                                if (originalSegment == null)
+                                    continue; // нет прямого ребра между current и next — пропускаем эту позицию
+
+                                var originalTime = originalSegment.Time;
+
+
+                                /* версия, которая порождает 500 ошибку при добавлении точек, так как если после оптимизации порядка точек (или в процессе вставки недостающих) в маршруте окажутся соседние точки без прямого ребра в исходном списке
+                                 * var originalTime = segments
                                     .First(s =>
                                         s.IdOutlet1 == current.OutletId
                                         && s.IdOutlet2 == next.OutletId
                                     )
                                     .Time;
+                                */
 
+                                // Учитываем оба ограничения - время и количество точек
                                 if (
-                                    dayRoute.TotalTime + totalAddedTime - originalTime
-                                    <= maxDailyTime + TimeTolerance
+                                    dayRoute.TotalTime + totalAddedTime - originalTime <= maxDailyTime + TimeTolerance
+                                    && dayRoute.Outlets.Count < maxCountVisitPerDay
                                 )
                                 {
                                     dayRoute.Outlets.Insert(
@@ -333,7 +383,12 @@ namespace RoutePlannerAPI.Services
                                     );
                                     dayRoute.TotalTime += totalAddedTime - originalTime;
                                     visitTracker.RecordVisit(outletId, dayRoute.DayNumber);
-                                    break;
+
+                                    // После добавления проверяем, не заполнили ли день
+                                    if (dayRoute.Outlets.Count >= maxCountVisitPerDay)
+                                    {
+                                        break; // День заполнен, выходим из цикла
+                                    }
                                 }
                             }
                         }
@@ -342,50 +397,60 @@ namespace RoutePlannerAPI.Services
             }
         }
 
+
+        // метод CalculateSegmentWeight преобразует различные бизнес-правила в единый числовой показатель
+        // который позволяет алгоритму принимать обоснованные решения на каждом шаге построения маршрута
         static double CalculateSegmentWeight(
-            RouteSegment segment,
+            RouteSegment segment, // сегменты (точки) маршрута
             VisitTracker tracker,
-            Dictionary<long, OutletInfo> outlets,
-            int currentDay
+            Dictionary<long, OutletInfo> outlets, // информация об атрибутах точек
+            int currentDay // текущий день планирования
         )
         {
-            var outlet = outlets[segment.IdOutlet2];
-            double weight = segment.Cost;
+            var outlet = outlets[segment.IdOutlet2]; // находим точку, в которую можно пройти из IdOutlet1 и получаем ее приоритет, частоту посещений и т.д.
+            double weight = segment.Cost; // получаем "стоимость" проезда до этой точки
 
             if (outlet.Priority >= 1) // Проверяем, что приоритет задан (>=1)
-                weight += PriorityWeightPenalty * (1.0 / outlet.Priority); // Инвертируем приоритет
+                weight += PriorityWeightPenalty * outlet.Priority; // умножаем штраф на приоритет, чем меньше приоритет, тем меньше штраф (1 -приоритет самые важные точки)
 
-            var visitsNeeded = tracker.GetRequiredVisits(segment.IdOutlet2, currentDay);
-            var visitsActual = tracker.GetVisitCount(segment.IdOutlet2);
+            var visitsNeeded = tracker.GetRequiredVisits(segment.IdOutlet2, currentDay); // сколько раз нужно посетить точку к текущему дню (на основе частоты посещений и пройденных дней)
+            var visitsActual = tracker.GetVisitCount(segment.IdOutlet2); // сколько раз уже посетили точку фактически
 
+            // если точку посещали меньше, чем требуется, уменьшаю вес, делая ее привлекательнее)))
             if (visitsActual < visitsNeeded)
                 weight -= (visitsNeeded - visitsActual) * 500;
 
+            // делает точку менее привлекательной после достижения целевого количества посещений
             if (visitsActual >= outlet.Frequency)
                 weight -= outlet.FrequencyPriority * FrequencyPriorityWeight;
 
+            // получаем итоговое значение веса для этого перемещения (сегмента)
             return weight;
         }
 
+        // метод CollectAllOutlets агрериует данные о точках в удобном виде, чтобы потом по ним строить маршруты
         static Dictionary<long, OutletInfo> CollectAllOutlets(List<RouteSegment> segments)
         {
-            var outlets = new Dictionary<long, OutletInfo>();
+            var outlets = new Dictionary<long, OutletInfo>(); // создаем пустой словарь, который будет заполняться информацией о точках
 
+            // прохожу по каждому сегменту маршрута из списка
             foreach (var segment in segments)
             {
-                if (!outlets.ContainsKey(segment.IdOutlet1))
+
+                // обработка для первой точки сегмента
+                if (!outlets.ContainsKey(segment.IdOutlet1)) // проверяю есть ли уже такая точка в словаре, если нет, то добавляю в словарь
                 {
-                    outlets[segment.IdOutlet1] = new OutletInfo
+                    outlets[segment.IdOutlet1] = new OutletInfo // создание и добавление записи в словарь
                     {
                         Id = segment.IdOutlet1,
                         Priority = segment.Priority1,
                         Frequency = segment.Frequency1,
                         FrequencyPriority = segment.FrequencyPriority1,
-                        TimeVisit =
-                            segment.TimeVisit1 > 0 ? segment.TimeVisit1 * 60 : DefaultVisitTime,
+                        TimeVisit = segment.TimeVisit1 > 0 ? segment.TimeVisit1 * 60 : DefaultVisitTime, // переводим время в секунды, если указан 0, то берется дефолтное
                     };
                 }
 
+                // обработка для второй точки сегмента
                 if (!outlets.ContainsKey(segment.IdOutlet2))
                 {
                     outlets[segment.IdOutlet2] = new OutletInfo
@@ -399,37 +464,42 @@ namespace RoutePlannerAPI.Services
                     };
                 }
             }
-
+            // возвращаю уникальный словарь со всеми парами точек и их атрибутами
             return outlets;
         }
 
+        // преобразование полученных результатов, подготвка данных для отправки результатов
+        // преобразует сложную структуру расписания в список записей
+        // используется для тестов, когда результат нужно вернуть CSV-файлом
         static List<CsvOutput> WriteToCsv(
-            List<DailyRoute> schedule,
-            Dictionary<long, OutletInfo> outlets
+            List<DailyRoute> schedule, // расписание маршрутов, которое получилось
+            Dictionary<long, OutletInfo> outlets // свойства точек
         )
         {
-            var records = new List<CsvOutput>();
+            var records = new List<CsvOutput>(); // создал список, в который будет выполнятся наполнение результатами
 
+            // перебор всех дней из полученного расписания
             foreach (var route in schedule)
             {
+                // для каждого дня перебираю все точки в порядке посещения
                 for (int i = 0; i < route.Outlets.Count; i++)
                 {
-                    var outletId = route.Outlets[i].OutletId;
-                    var outletInfo = outlets[outletId];
+                    var outletId = route.Outlets[i].OutletId; // беру ID точки из маршрута
+                    var outletInfo = outlets[outletId]; // ее свойства
 
                     records.Add(
                         new CsvOutput
                         {
-                            DayNumber = route.DayNumber,
-                            RoutePointNumber = i + 1,
-                            OutletId = outletId,
-                            Priority = outletInfo.Priority,
-                            Frequency = outletInfo.Frequency,
-                            FrequencyPriority = outletInfo.FrequencyPriority,
-                            VisitTime = route.Outlets[i].VisitTime,
-                            TravelTime = route.Outlets[i].TravelTime,
-                            TotalRouteTime = route.TotalTime,
-                            TotalRouteCost = route.TotalCost,
+                            DayNumber = route.DayNumber, // Номер дня (из DailyRoute)
+                            RoutePointNumber = i + 1, // Порядковый номер точки в маршруте дня
+                            OutletId = outletId, // ID точки
+                            Priority = outletInfo.Priority, // Приоритет точки (из справочника)
+                            Frequency = outletInfo.Frequency, // Частота посещений (из справочника)
+                            FrequencyPriority = outletInfo.FrequencyPriority, // Приоритет частоты
+                            VisitTime = route.Outlets[i].VisitTime, // Время посещения (из маршрута)
+                            TravelTime = route.Outlets[i].TravelTime, // Время пути до точки (из маршрута)
+                            TotalRouteTime = route.TotalTime, // Общее время всего маршрута дня
+                            TotalRouteCost = route.TotalCost, // Общая стоимость маршрута дня
                         }
                     );
                 }

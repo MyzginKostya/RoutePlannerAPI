@@ -1,5 +1,8 @@
 ﻿namespace RoutePlannerAPI.Models
 {
+    /// <summary>
+    /// представляет ориентированный сегмент маршрута между двумя точками — это ребро в графе, содержащее все метрики и атрибуты для перемещения от точки A к точке B
+    /// </summary>
     public class RouteSegment
     {
 
@@ -16,7 +19,7 @@
         public int Frequency2 { get; set; }
         public int FrequencyPriority1 { get; set; }
         public int FrequencyPriority2 { get; set; }
-        public char TypeMovements  {get; set; }
+        //public char TypeMovements  {get; set; }
 
     }
 }
