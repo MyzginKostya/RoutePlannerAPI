@@ -1,10 +1,11 @@
-﻿using System.Formats.Asn1;
-using System.Globalization;
-using System.Text.Json.Serialization;
-using CsvHelper;
+﻿using CsvHelper;
 using CsvHelper.Configuration;
+using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
 using RoutePlannerAPI.Models;
+using System.Formats.Asn1;
+using System.Globalization;
+using System.Text.Json.Serialization;
 
 namespace RoutePlannerAPI.Services
 {
@@ -17,13 +18,113 @@ namespace RoutePlannerAPI.Services
         public const int FrequencyPriorityWeight = 200;
         public const double MaxDistanceLimit = 100; // Максимальное расстояние между точками в км (кроме первой пары)
 
-        // это я пока оставлю. Сейчас не использую, но в будущем хотел бы прикрутить
-        public enum PlanningPeriod
+        private static long GetSuitableStartOutlet(
+             Dictionary<long, OutletInfo> outlets,
+             List<RouteSegment> segments,
+             VisitTracker visitTracker,
+             int currentDay,
+             HashSet<long> excludedOutlets = null)
         {
-            Week = 7,
-            Month = 30,
-            Quarter = 65,
-            Custom = 57,
+            excludedOutlets ??= new HashSet<long>();
+
+            // Выбираем точки, которые можно посетить в этот день и не исключены
+            var availableOutlets = outlets
+                .Where(kvp => visitTracker.CanVisit(kvp.Key, currentDay) &&
+                             !excludedOutlets.Contains(kvp.Key))
+                .ToList();
+
+            if (!availableOutlets.Any())
+            {
+                // Если нет доступных точек, возвращаем первую из всех
+                return outlets.Keys.FirstOrDefault();
+            }
+
+            // Рассчитываем score для каждой доступной точки
+            var scoredOutlets = availableOutlets
+                .Select(kvp =>
+                {
+                    var outletId = kvp.Key;
+                    var outletInfo = kvp.Value;
+
+                    // Количество исходящих связей (чем больше, тем лучше)
+                    int connectionCount = segments.Count(s => s.IdOutlet1 == outletId);
+
+                    // Среднее расстояние до соседей (чем меньше, тем лучше)
+                    var connectedSegments = segments.Where(s => s.IdOutlet1 == outletId).ToList();
+                    double avgDistance = connectedSegments.Any() ?
+                        connectedSegments.Average(s => s.Length) : double.MaxValue;
+
+                    // Приоритет точки (чем ВЫШЕ приоритет, тем ХУЖЕ - инвертируем)
+                    double priorityScore = (100 - outletInfo.Priority) * 100; // Приоритет 1 → score 500, приоритет 5 → score 100
+
+                    // Срочность посещения (чем чаще нужно посещать, тем лучше для старта)
+                    int requiredVisits = visitTracker.GetRequiredVisits(outletId, currentDay);
+                    int actualVisits = visitTracker.GetVisitCount(outletId);
+                    int visitUrgency = Math.Max(0, requiredVisits - actualVisits) * 200;
+
+                    // Частота посещений (чем выше частота, тем важнее точка)
+                    double frequencyScore = outletInfo.Frequency * 50;
+
+                    // Приоритет частоты (чем выше, тем важнее)
+                    double frequencyPriorityScore = outletInfo.FrequencyPriority * 300;
+
+                    // Наличие связей
+                    double connectionScore = connectionCount * 1000;
+
+                    // Итоговый score (чем выше, тем лучше)
+                    double totalScore = connectionScore / Math.Max(1, avgDistance) +
+                                      priorityScore +
+                                      visitUrgency +
+                                      frequencyScore +
+                                      frequencyPriorityScore;
+
+                    return new
+                    {
+                        OutletId = outletId,
+                        Score = totalScore,
+                        ConnectionCount = connectionCount,
+                        AvgDistance = avgDistance,
+                        Priority = outletInfo.Priority,
+                        VisitUrgency = visitUrgency,
+                        HasConnections = connectionCount > 0
+                    };
+                })
+                .OrderByDescending(x => x.HasConnections) // Сначала точки с связями
+                .ThenByDescending(x => x.Score)           // Затем по score
+                .ThenBy(x => x.AvgDistance)               // При равном score предпочитаем точки с меньшим средним расстоянием
+                .ToList();
+
+            // Логируем топ-3 варианта для отладки
+            if (scoredOutlets.Any())
+            {
+                Console.WriteLine($"Топ-3 кандидатов для дня {currentDay}:");
+                foreach (var candidate in scoredOutlets.Take(3))
+                {
+                    Console.WriteLine($"  Точка {candidate.OutletId}: Score={candidate.Score:F0}, " +
+                                    $"Connections={candidate.ConnectionCount}, " +
+                                    $"AvgDist={candidate.AvgDistance:F1}km, " +
+                                    $"Priority={candidate.Priority}, " +
+                                    $"Urgency={candidate.VisitUrgency}");
+                }
+            }
+
+            return scoredOutlets.FirstOrDefault()?.OutletId ?? outlets.Keys.First();
+        }
+
+        private static bool HasConnections(long outletId, List<RouteSegment> segments)
+        {
+            return segments.Any(s => s.IdOutlet1 == outletId);
+        }
+
+        private static long GetAlternativeStartOutlet(
+            Dictionary<long, OutletInfo> outlets,
+            List<RouteSegment> segments,
+            HashSet<long> excludedOutlets,
+            VisitTracker visitTracker,
+            int currentDay)
+        {
+            // Просто используем основной метод с исключениями
+            return GetSuitableStartOutlet(outlets, segments, visitTracker, currentDay, excludedOutlets);
         }
 
 
@@ -31,7 +132,9 @@ namespace RoutePlannerAPI.Services
         // возвращает результат в виде списка объектов CsvOutput
         public async Task<List<CsvOutput>> GenerateScheduleAsync(RoutePlanRequest request)
         {
-            // ряд проверок на корректность входных данных
+
+
+            // несколько проверок на корректность входных данных
             if (request == null)
                 throw new ArgumentNullException("Request body is null.");
 
@@ -72,14 +175,15 @@ namespace RoutePlannerAPI.Services
 
             // создаем расписание
             var schedule = GenerateScheduleInternal(
-                segments,
-                request.TotalDays,
-                request.WorkingHoursPerDay,
-                request.MaxCountVisists,
-                request.UseFixedStartPoint,
-                request.FixedStartPointId,
-                outlets
-            );
+                    segments,
+                    request.TotalDays,
+                    request.WorkingHoursPerDay,
+                    request.MaxCountVisists,
+                    request.UseFixedStartPoint,
+                    request.FixedStartPointId,
+                    outlets
+             );
+
 
             // оптимизация маршрута в рамках одного дня
             var optimizedSchedule = RouteOptimizer.OptimizeDailyRoutes(
@@ -88,9 +192,11 @@ namespace RoutePlannerAPI.Services
                 request.UseFixedStartPoint
             );
 
+
             var response = MapToResponse(optimizedSchedule, outlets);
             var result = WriteToCsv(optimizedSchedule, outlets);
             return result;
+
         }
 
         private List<DailyRoute> GenerateScheduleInternal(
@@ -104,14 +210,15 @@ namespace RoutePlannerAPI.Services
         )
         {
             var schedule = new List<DailyRoute>(); // список с результатом сформированного дневного маршрута
-            var random = new Random(); // чтобы генерировать случайные числа
             var visitTracker = new VisitTracker(outlets, totalDays); // счетчик количества посещений каждой точки
             var routeHistory = new HashSet<string>(); // хочу всегда уникальные маршруты
 
             double maxDailyTime = workingHoursPerDay * 3600; // переводим максимальное количество времени на маршрут из часов в секунды
+
+            // Начальная стартовая точка
             long currentStartOutlet = useFixedStartPoint
                 ? fixedStartPointId // если нужна фиксированная точка, то берем ее ID
-                : outlets.Keys.ElementAt(random.Next(outlets.Count)); // иначе выбор стартовой точки рандомно
+                : GetSuitableStartOutlet(outlets, segments, visitTracker, 1); // иначе выбор оптимальной стартовой точки для дня 1
 
             for (int day = 1; day <= totalDays; day++) // начинаем цикл по всем дням от первого до номера в totalDays
             {
@@ -120,6 +227,12 @@ namespace RoutePlannerAPI.Services
                 var visitedToday = new HashSet<long>(); // записываем точки, посещенные в этот день - гарант того, что мы не посетим точку более одного раза за день
                 int attempt = 0; // сколько раз попытались построить уникальный маршрут
                 const int maxAttempts = 100; // не более 100 раз пытаемся
+
+                // Обновляем стартовую точку для этого дня (если не фиксированная)
+                if (!useFixedStartPoint)
+                {
+                    currentStartOutlet = GetSuitableStartOutlet(outlets, segments, visitTracker, day, visitedToday);
+                }
 
                 // циклом строим уникальные маршруты
                 // Если построенный маршрут совпадает с каким-то из ранее созданных (routeHistory), он делает новую попытку
@@ -131,7 +244,19 @@ namespace RoutePlannerAPI.Services
 
                     long currentOutlet = currentStartOutlet; // начинаем день с выбранной стартовой точки
 
-                    if (useFixedStartPoint || visitTracker.CanVisit(currentOutlet, day)) // проверяем можем ли мы посетить эту ТТ, согласно частоте посещений + берем стартовую ТТ
+                    // Проверяем что стартовая точка имеет связи с другими точками
+                    if (!HasConnections(currentOutlet, segments))
+                    {
+                        // Если нет связей, выбираем альтернативную точку
+                        currentOutlet = GetAlternativeStartOutlet(outlets, segments, visitedToday, visitTracker, day);
+                        if (currentOutlet == 0)
+                        {
+                            Console.WriteLine($"Не удалось найти подходящую стартовую точку для дня {day}");
+                            break;
+                        }
+                    }
+
+                    if (visitTracker.CanVisit(currentOutlet, day) && !visitedToday.Contains(currentOutlet)) // проверяем можем ли мы посетить эту ТТ, согласно частоте посещений
                     {
                         var visitTime = outlets[currentOutlet].TimeVisit;
                         dailyRoute.Outlets.Add(
@@ -145,10 +270,27 @@ namespace RoutePlannerAPI.Services
                         dailyTimeUsed += visitTime;
                         visitedToday.Add(currentOutlet); // помечаю точку как посещенную
                     }
+                    else
+                    {
+                        // Если нельзя посетить стартовую точку, выбираем другую
+                        currentOutlet = GetAlternativeStartOutlet(outlets, segments, visitedToday, visitTracker, day);
+                        if (currentOutlet == 0) break;
+
+                        var visitTime = outlets[currentOutlet].TimeVisit;
+                        dailyRoute.Outlets.Add(
+                            new RoutePoint
+                            {
+                                OutletId = currentOutlet,
+                                VisitTime = visitTime,
+                                TravelTime = 0,
+                            }
+                        );
+                        dailyTimeUsed += visitTime;
+                        visitedToday.Add(currentOutlet);
+                    }
 
                     while (dailyTimeUsed < maxDailyTime) // проверяю, что в рабочем дне еще есть время для посещений
                     {
-
                         if (dailyRoute.Outlets.Count >= MaxCountVisits) // проверка на превышение максимального количества посещений в день
                         {
                             Console.WriteLine($"Достигнуто максимальное количество точек ({MaxCountVisits}) для дня {day}");
@@ -170,7 +312,7 @@ namespace RoutePlannerAPI.Services
 
                         if (!availableSegments.Any()) // если не нашли ни одного варианта, то есть зашли в тупик, то выходим из цикла
                         {
-                            Console.WriteLine($"Нет доступных точек для дня {day}");
+                            Console.WriteLine($"Нет доступных точек для дня {day} из точки {currentOutlet}");
                             break;
                         }
 
@@ -225,15 +367,17 @@ namespace RoutePlannerAPI.Services
                     schedule.Add(dailyRoute); // добавление в раписание
                 }
 
-                if (!useFixedStartPoint) // если стартовая точка не была фиксированной, то начинаем следующий день с той точки, которая была посещена меньше всего раз
+                if (!useFixedStartPoint) // если стартовая точка не была фиксированной, то начинаем следующий день с новой оптимальной точки
                 {
-                    currentStartOutlet = visitTracker.GetLeastVisitedOutlet(outlets.Keys);
+                    // Для следующего дня будет выбрана новая оптимальная точка в начале цикла
                 }
             }
 
             AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime, MaxCountVisits); // если маршруты созданы на все дни, но остались точки которые нужно еще посетить, то пытаемся добавить их в уже существующие маршруты
             return schedule; // возвращаю готовое расписание
         }
+
+
 
         private RoutePlanResponse MapToResponse(
             List<DailyRoute> schedule, // итоговое расписание маршрутов
