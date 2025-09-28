@@ -8,7 +8,7 @@ namespace RoutePlannerAPI.Services
     public class RouteOptimizer
     {
         // это костыль, который я чуть позже хочу оптимизировать, чтобы перебор вариантов работал быстрее
-        private const int TimeLimitSeconds = 10; // лимит времени на перебор вариантов
+        private const int TimeLimitSeconds = 3; // лимит времени на перебор вариантов
         private const int MaxPermutations = 1000; // лимит на количество итераций
 
         public static List<DailyRoute> OptimizeDailyRoutes(
