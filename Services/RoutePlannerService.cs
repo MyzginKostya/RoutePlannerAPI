@@ -310,10 +310,25 @@ namespace RoutePlannerAPI.Services
                             .Where(s => s != null) // проверка на отсутсвие null значений
                             .ToList(); // представляем все это списком
 
-                        if (!availableSegments.Any()) // если не нашли ни одного варианта, то есть зашли в тупик, то выходим из цикла
+                        if (!availableSegments.Any())
                         {
-                            Console.WriteLine($"Нет доступных точек для дня {day} из точки {currentOutlet}");
-                            break;
+                            // Проверить, есть ли вообще доступные точки, которые еще не посещались сегодня
+                            var allAvailableOutlets = segments
+                                .Where(s => s.IdOutlet1 == currentOutlet)
+                                .Select(s => s.IdOutlet2)
+                                .Where(id => !visitedToday.Contains(id))
+                                .ToList();
+
+                            if (!allAvailableOutlets.Any())
+                            {
+                                Console.WriteLine($"Нет доступных непосещенных точек для дня {day} из точки {currentOutlet}");
+                                break;
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Есть доступные точки, но они недоступны по частоте посещений: {string.Join(", ", allAvailableOutlets)}");
+                                break;
+                            }
                         }
 
                         // выбираю лучший вариант
@@ -373,7 +388,7 @@ namespace RoutePlannerAPI.Services
                 }
             }
 
-            AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime, MaxCountVisits); // если маршруты созданы на все дни, но остались точки которые нужно еще посетить, то пытаемся добавить их в уже существующие маршруты
+            //AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime, MaxCountVisits); // если маршруты созданы на все дни, но остались точки которые нужно еще посетить, то пытаемся добавить их в уже существующие маршруты
             return schedule; // возвращаю готовое расписание
         }
 
