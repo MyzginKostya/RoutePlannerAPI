@@ -474,9 +474,13 @@ namespace RoutePlannerAPI.Services
                         {
                             continue; // Пропускаем этот день, он уже заполнен
                         }
+                        //  точка уже есть в этом дне?
+                        if (dayRoute.Outlets.Any(o => o.OutletId == outletId))
+                            continue;
 
-                        if (visitTracker.GetVisitCount(outletId) >= outlet.Frequency)
-                            break;
+                        // можем ли посетить точку в этот день?
+                        if (!visitTracker.CanVisit(outletId, dayRoute.DayNumber))
+                            continue;
 
                         for (int i = 0; i < dayRoute.Outlets.Count - 1; i++)
                         {
