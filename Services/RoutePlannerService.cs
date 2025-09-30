@@ -395,7 +395,7 @@ namespace RoutePlannerAPI.Services
                 }
             }
 
-            //AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime, MaxCountVisits); // если маршруты созданы на все дни, но остались точки которые нужно еще посетить, то пытаемся добавить их в уже существующие маршруты
+            AddMissingOutlets(schedule, segments, outlets, visitTracker, maxDailyTime, MaxCountVisits); // если маршруты созданы на все дни, но остались точки которые нужно еще посетить, то пытаемся добавить их в уже существующие маршруты
             return schedule; // возвращаю готовое расписание
         }
 
