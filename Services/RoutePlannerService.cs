@@ -226,7 +226,7 @@ namespace RoutePlannerAPI.Services
                 double dailyTimeUsed = 0; // переменная для подсчета времени на маршруте за день
                 var visitedToday = new HashSet<long>(); // записываем точки, посещенные в этот день - гарант того, что мы не посетим точку более одного раза за день
                 int attempt = 0; // сколько раз попытались построить уникальный маршрут
-                const int maxAttempts = 100; // не более 100 раз пытаемся
+                const int maxAttempts = 50; // не более 100 раз пытаемся
 
                 // Обновляем стартовую точку для этого дня (если не фиксированная)
                 if (!useFixedStartPoint)
@@ -340,6 +340,13 @@ namespace RoutePlannerAPI.Services
                         var nextOutlet = bestSegment.IdOutlet2; // находим выбранную точку с ее атрибутами
                         var visitTime = outlets[nextOutlet].TimeVisit; // получаем время визита для выбранной точки
                         var totalTime = bestSegment.Time + visitTime; // общее время складывается из времени в пути до точки + время на визит в ТТ
+
+                        // ФИНАЛЬНАЯ ПРОВЕРКА ПЕРЕД ДОБАВЛЕНИЕМ
+                        if (visitedToday.Contains(nextOutlet))
+                        {
+                            Console.WriteLine($"КРИТИЧЕСКАЯ ОШИБКА: точка {nextOutlet} уже в visitedToday");
+                            break;
+                        }
 
                         if (dailyTimeUsed + totalTime > maxDailyTime + TimeTolerance) // проверка на то, что на маршруте сотрудник потратит не больше чем это задано + 10 минут (допуск)
                             break; // выходим из цикла если день заполнен
